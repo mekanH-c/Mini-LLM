@@ -12,6 +12,13 @@ from mini_infer.loader import (
     count_parameters,
     resolve_model_files,
 )
+from mini_infer.sampling import (
+    sample,
+    sample_greedy,
+    sample_top_k,
+    sample_top_p,
+)
+from mini_infer.generate import generate, GenerationOutput
 
 __version__ = "0.1.0"
 
@@ -30,4 +37,10 @@ __all__ = [
     "get_hf_key_mapping",
     "count_parameters",
     "resolve_model_files",
+    "sample",
+    "sample_greedy",
+    "sample_top_k",
+    "sample_top_p",
+    "generate",
+    "GenerationOutput",
 ]
