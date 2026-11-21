@@ -10,6 +10,17 @@ Key concepts, architectural terms, and performance metrics explained simply for 
   - *MQA*: All query heads share a single key and value head ($H_{KV} = 1$). Fast, low memory, but potential degradation in quality.
   - *GQA*: Query heads are partitioned into groups, where each group shares a key and value head ($1 < H_{KV} < H_Q$). SmolLM-135M uses GQA (e.g., 9 query heads, 3 KV heads).
 - **SwiGLU (Swish Gated Linear Unit)**: A non-linear feedforward layer that computes $\text{SwiGLU}(x) = (\text{Linear}_1(x) \odot \text{SiLU}(\text{Linear}_2(x))) \times W_{down}$. Provides higher expressivity than standard ReLU/GELU FFNs.
+- **Tied Word Embeddings**: Architectural technique where the language model head projection weights (`lm_head.weight`) are shared directly with the input token embedding table (`model.embed_tokens.weight`), saving millions of parameters in memory without degrading token representation.
+
+### Sampling Strategies
+- **Greedy Decoding**: Deterministic token selection choosing $\text{argmax}(\text{logits})$. Zero stochasticity.
+- **Temperature Scaling**: Dividing logits by scalar $T > 0$ before softmax ($z_i / T$). High $T$ flattens the distribution towards uniform randomness; low $T$ sharpens it toward greedy argmax.
+- **Top-$K$ Filtering**: Retains only the $K$ tokens with the highest unnormalized logits, masking all other tokens to $-\infty$.
+- **Top-$P$ (Nucleus) Sampling**: Sorts tokens descending by probability and computes the cumulative distribution function (CDF). Retains the smallest set of tokens whose cumulative mass exceeds threshold $P$, dynamically adapting the candidate pool size based on distribution certainty.
+
+### Numerical Formats & Precision
+- **FP32 (Single Precision)**: 1 sign bit, 8 exponent bits, 23 mantissa bits. Full precision standard.
+- **BF16 (Brain Floating Point)**: 1 sign bit, 8 exponent bits (same dynamic range as FP32), 7 mantissa bits. Reduces memory by $2\times$ while avoiding FP16 underflow/overflow scaling issues, but has lower precision per operation.
 
 ### Inference & Serving
 - **Prefill (Prompt Processing)**: The compute-bound phase where the entire prompt sequence is processed in parallel to generate initial KV caches and the first output token.
