@@ -78,7 +78,9 @@ class RotaryEmbedding(nn.Module):
         self._set_cos_sin_cache(max_position_embeddings)
 
     def _set_cos_sin_cache(self, seq_len: int) -> None:
-        t = torch.arange(seq_len, dtype=torch.float32)
+        # Crucial: t must be created on self.inv_freq.device so dynamic recomputation
+        # on GPU never fails with a device mismatch (cuda vs cpu).
+        t = torch.arange(seq_len, device=self.inv_freq.device, dtype=torch.float32)
         # Outer product: (seq_len, dim // 2)
         freqs = torch.outer(t, self.inv_freq)
         # Duplicate to form full head_dim: (seq_len, dim)

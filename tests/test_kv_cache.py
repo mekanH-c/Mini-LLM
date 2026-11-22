@@ -245,3 +245,70 @@ def test_real_smollm_long_prompt_cache_depth(model_and_tokenizer) -> None:
     print(f"  Exact Match:   YES (all {max_new_tokens} tokens match naive)")
     print(f"  Cache Depth:   Successfully cached and retrieved across positions 0 to {prompt_len + max_new_tokens - 1}")
     print(f"  Generated Text: {out_cached.text[0]!r}")
+
+
+def test_rope_dynamic_cache_growth_and_device_alignment() -> None:
+    """Test that RotaryEmbedding dynamically grows when sequence length exceeds max_position_embeddings,
+    and verify that all newly created internal buffers match inv_freq's device and dtype."""
+    dim = 64
+    initial_max_len = 16
+    rotary = RotaryEmbedding(dim=dim, max_position_embeddings=initial_max_len)
+
+    # Initial state
+    assert rotary.cos_cached.shape[2] == initial_max_len
+    assert rotary.sin_cached.shape[2] == initial_max_len
+
+    # Forward pass with seq_len > initial_max_len (triggers _set_cos_sin_cache)
+    target_len = 48
+    dummy_x = torch.zeros(1, 1, 1, dim)
+    cos, sin = rotary(dummy_x, seq_len=target_len, start_pos=0)
+
+    # Verify dynamic expansion
+    assert rotary.cos_cached.shape[2] == target_len
+    assert rotary.sin_cached.shape[2] == target_len
+    assert cos.shape == (1, 1, target_len, dim)
+    assert sin.shape == (1, 1, target_len, dim)
+    assert rotary.cos_cached.device == rotary.inv_freq.device
+    assert rotary.sin_cached.device == rotary.inv_freq.device
+
+    # Test device consistency when module buffers are on GPU if CUDA is available
+    if torch.cuda.is_available():
+        rotary_cuda = RotaryEmbedding(dim=dim, max_position_embeddings=16).to("cuda")
+        x_cuda = torch.zeros(1, 1, 1, dim, device="cuda")
+        # Trigger dynamic growth on CUDA: previously failed with RuntimeError: Expected all tensors to be on the same device
+        cos_cuda, sin_cuda = rotary_cuda(x_cuda, seq_len=64, start_pos=0)
+        assert cos_cuda.device.type == "cuda"
+        assert rotary_cuda.cos_cached.device.type == "cuda"
+        assert rotary_cuda.sin_cached.device.type == "cuda"
+    else:
+        # On CPU, verify t in _set_cos_sin_cache explicitly matches self.inv_freq.device
+        assert rotary.inv_freq.device.type == "cpu"
+        assert rotary.cos_cached.device == rotary.inv_freq.device
+
+
+def test_kv_cache_dynamic_growth() -> None:
+    """Test that KVCache dynamically expands buffers when incoming tokens exceed max_seq_len."""
+    cache = KVCache(
+        num_layers=2,
+        batch_size=1,
+        num_kv_heads=2,
+        head_dim=16,
+        max_seq_len=8,  # Small initial capacity
+    )
+    assert cache.max_seq_len == 8
+
+    # Prefill 6 tokens
+    k1 = torch.randn(1, 2, 6, 16)
+    v1 = torch.randn(1, 2, 6, 16)
+    k_out, v_out = cache.update(layer_idx=0, k_val=k1, v_val=v1, start_pos=0)
+    assert k_out.shape == (1, 2, 6, 16)
+    assert cache.max_seq_len == 8
+
+    # Exceed capacity: insert 4 tokens at start_pos = 6 (total 10 > 8)
+    k2 = torch.randn(1, 2, 4, 16)
+    v2 = torch.randn(1, 2, 4, 16)
+    k_out2, v_out2 = cache.update(layer_idx=0, k_val=k2, v_val=v2, start_pos=6)
+    assert k_out2.shape == (1, 2, 10, 16)
+    assert cache.max_seq_len >= 10  # Buffer dynamically expanded!
+    assert k_out2.device == cache.k_cache[0].device
+    assert v_out2.device == cache.v_cache[0].device

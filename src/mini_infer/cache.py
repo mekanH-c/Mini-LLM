@@ -52,7 +52,7 @@ class KVCache:
         self.device = device or torch.device("cpu")
         self.dtype = dtype
 
-        # Pre-allocate contiguous zeroed buffers for all layers
+        # Pre-allocate contiguous zeroed buffers for all layers on the specified device
         self.k_cache: List[torch.Tensor] = [
             torch.zeros(
                 (batch_size, num_kv_heads, max_seq_len, head_dim),
@@ -90,24 +90,37 @@ class KVCache:
             dtype=dtype,
         )
 
+    def to(self, device: torch.device) -> "KVCache":
+        """Moves all cached tensors to the specified device."""
+        self.device = torch.device(device)
+        self.k_cache = [k.to(self.device) for k in self.k_cache]
+        self.v_cache = [v.to(self.device) for v in self.v_cache]
+        return self
+
     def _grow_cache(self, new_max_len: int) -> None:
         """Dynamically expands the pre-allocated cache buffers if capacity is exceeded."""
+        ref_device = self.k_cache[0].device
+        ref_dtype = self.k_cache[0].dtype
+
         for i in range(self.num_layers):
             new_k = torch.zeros(
                 (self.batch_size, self.num_kv_heads, new_max_len, self.head_dim),
-                dtype=self.dtype,
-                device=self.device,
+                dtype=ref_dtype,
+                device=ref_device,
             )
             new_v = torch.zeros(
                 (self.batch_size, self.num_kv_heads, new_max_len, self.head_dim),
-                dtype=self.dtype,
-                device=self.device,
+                dtype=ref_dtype,
+                device=ref_device,
             )
             new_k[:, :, : self.max_seq_len, :] = self.k_cache[i]
             new_v[:, :, : self.max_seq_len, :] = self.v_cache[i]
             self.k_cache[i] = new_k
             self.v_cache[i] = new_v
+
         self.max_seq_len = new_max_len
+        self.device = ref_device
+        self.dtype = ref_dtype
 
     def update(
         self,
@@ -129,6 +142,10 @@ class KVCache:
             `start_pos + seq_len`, each of shape:
             (batch_size, num_kv_heads, start_pos + seq_len, head_dim)
         """
+        # Ensure device parity between cache and incoming activations
+        if self.k_cache[0].device != k_val.device:
+            self.to(k_val.device)
+
         batch_size, _, seq_len, _ = k_val.shape
         end_pos = start_pos + seq_len
 
