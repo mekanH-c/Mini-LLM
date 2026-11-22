@@ -1,6 +1,6 @@
-"""LLaMA Model Architecture (Transformer Block, Base Model, and Causal LM)."""
+"""LLaMA Model Architecture (Transformer Block, Base Model, and Causal LM) with KV Cache support."""
 
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
 import torch
 import torch.nn as nn
 
@@ -9,12 +9,15 @@ from mini_infer.norm import RMSNorm
 from mini_infer.attention import GroupedQueryAttention
 from mini_infer.mlp import SwiGLUMLP
 
+if TYPE_CHECKING:
+    from mini_infer.cache import KVCache
+
 
 class TransformerBlock(nn.Module):
-    """A single Transformer Decoder layer with Pre-RMSNorm and residual connections.
+    """A single Transformer Decoder layer with Pre-RMSNorm, GQA (with KV Cache), and residual connections.
 
     Flow:
-        x -> RMSNorm -> Attention -> + Residual -> RMSNorm -> MLP -> + Residual -> out
+        x -> RMSNorm -> Attention(kv_cache) -> + Residual -> RMSNorm -> MLP -> + Residual -> out
 
     Args:
         config: LlamaConfig containing layer dimensions.
@@ -31,12 +34,18 @@ class TransformerBlock(nn.Module):
         self,
         x: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
+        kv_cache: Optional["KVCache"] = None,
+        layer_idx: Optional[int] = None,
+        start_pos: int = 0,
     ) -> torch.Tensor:
         """Forward pass for TransformerBlock.
 
         Args:
             x: Input tensor of shape (batch_size, seq_len, hidden_size)
             attention_mask: Optional attention mask tensor
+            kv_cache: Optional KVCache instance for caching keys and values
+            layer_idx: Current layer index (0 to num_layers - 1)
+            start_pos: Starting position index in the sequence
 
         Returns:
             Output tensor of shape (batch_size, seq_len, hidden_size)
@@ -44,7 +53,13 @@ class TransformerBlock(nn.Module):
         # Self-attention with pre-normalization and residual connection
         residual = x
         x = self.input_layernorm(x)
-        x = self.self_attn(x, attention_mask=attention_mask)
+        x = self.self_attn(
+            x,
+            attention_mask=attention_mask,
+            kv_cache=kv_cache,
+            layer_idx=layer_idx,
+            start_pos=start_pos,
+        )
         x = residual + x
 
         # Feed-forward MLP with pre-normalization and residual connection
@@ -76,12 +91,16 @@ class LlamaModel(nn.Module):
         self,
         input_ids: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
+        kv_cache: Optional["KVCache"] = None,
+        start_pos: int = 0,
     ) -> torch.Tensor:
         """Forward pass through token embeddings, all transformer layers, and final norm.
 
         Args:
             input_ids: LongTensor of shape (batch_size, seq_len)
             attention_mask: Optional attention mask tensor
+            kv_cache: Optional KVCache instance
+            start_pos: Starting sequence position (0 for prefill, t for decode)
 
         Returns:
             hidden_states: FloatTensor of shape (batch_size, seq_len, hidden_size)
@@ -89,8 +108,14 @@ class LlamaModel(nn.Module):
         # Shape: (batch_size, seq_len, hidden_size)
         hidden_states = self.embed_tokens(input_ids)
 
-        for layer in self.layers:
-            hidden_states = layer(hidden_states, attention_mask=attention_mask)
+        for layer_idx, layer in enumerate(self.layers):
+            hidden_states = layer(
+                hidden_states,
+                attention_mask=attention_mask,
+                kv_cache=kv_cache,
+                layer_idx=layer_idx,
+                start_pos=start_pos,
+            )
 
         # Final RMSNorm across hidden dimension
         hidden_states = self.norm(hidden_states)
@@ -118,18 +143,27 @@ class LlamaForCausalLM(nn.Module):
         self,
         input_ids: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
+        kv_cache: Optional["KVCache"] = None,
+        start_pos: int = 0,
     ) -> torch.Tensor:
         """Forward pass to compute unnormalized token logits.
 
         Args:
             input_ids: LongTensor of shape (batch_size, seq_len)
             attention_mask: Optional attention mask tensor
+            kv_cache: Optional KVCache instance
+            start_pos: Starting sequence position
 
         Returns:
             logits: FloatTensor of shape (batch_size, seq_len, vocab_size)
         """
         # hidden_states: (batch_size, seq_len, hidden_size)
-        hidden_states = self.model(input_ids, attention_mask=attention_mask)
+        hidden_states = self.model(
+            input_ids,
+            attention_mask=attention_mask,
+            kv_cache=kv_cache,
+            start_pos=start_pos,
+        )
         # logits: (batch_size, seq_len, vocab_size)
         logits = self.lm_head(hidden_states)
         return logits

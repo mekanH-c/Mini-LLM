@@ -92,19 +92,22 @@ class RotaryEmbedding(nn.Module):
         self,
         x: torch.Tensor,
         seq_len: int,
+        start_pos: int = 0,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Retrieve precomputed cos and sin slices for sequence length `seq_len`.
+        """Retrieve precomputed cos and sin slices starting at `start_pos` for length `seq_len`.
 
         Args:
             x: Input tensor (used to match device and dtype)
-            seq_len: Number of tokens in the current sequence
+            seq_len: Number of tokens in the current sequence chunk (1 during decode)
+            start_pos: Starting position index in the sequence (0 for prefill, t for decode)
 
         Returns:
             Tuple of (cos, sin) tensors of shape (1, 1, seq_len, dim)
         """
-        if seq_len > self.cos_cached.shape[2]:
-            self._set_cos_sin_cache(seq_len)
+        end_pos = start_pos + seq_len
+        if end_pos > self.cos_cached.shape[2]:
+            self._set_cos_sin_cache(end_pos)
 
-        cos = self.cos_cached[:, :, :seq_len, :].to(dtype=x.dtype, device=x.device)
-        sin = self.sin_cached[:, :, :seq_len, :].to(dtype=x.dtype, device=x.device)
+        cos = self.cos_cached[:, :, start_pos:end_pos, :].to(dtype=x.dtype, device=x.device)
+        sin = self.sin_cached[:, :, start_pos:end_pos, :].to(dtype=x.dtype, device=x.device)
         return cos, sin
