@@ -25,6 +25,11 @@ Key concepts, architectural terms, and performance metrics explained simply for 
 ### Inference & Serving
 - **Prefill (Prompt Processing)**: The compute-bound phase where the entire prompt sequence is processed in parallel to generate initial KV caches and the first output token.
 - **Decode (Token Generation)**: The memory-bandwidth-bound phase where tokens are generated autoregressively one by one, reading the KV cache for all previous tokens at each step.
+- **KV Cache (Key-Value Cache)**: Stores key and value projections across all transformer layers for historical tokens ($0 \dots t$). Decouples autoregressive decoding so each step only computes projections for the single newest token, reducing generation time complexity from $O(N^2)$ to $O(N)$.
+- **KV Cache Memory Footprint Formula**: The memory occupied by past keys and values across the model:
+  $$\text{Memory (bytes)} = 2 \times L \times B \times H_{KV} \times S \times d_{\text{head}} \times \text{bytes\_per\_elem}$$
+  For SmolLM-135M ($L=30, B=1, H_{KV}=3, S=2048, d_{\text{head}}=64$, float32), the full cache occupies exactly $94,371,840 \text{ bytes} \approx 94.37 \text{ MB}$ ($90 \text{ MiB}$).
+- **Decode Phase Rotary Alignment**: In decode, the single query token across all heads at position $t$ is rotated using angles derived from $t$, guaranteeing that dot products $\langle R_t q, R_s k \rangle = q^T R_{t-s} k$ yield identical relative position attention scores as a full-sequence forward pass.
 - **TTFT (Time to First Token)**: Time taken from request arrival until the first token is emitted (dominated by prefill latency).
 - **TPOT (Time Per Output Token) / Inter-token Latency**: Average time to generate each subsequent token during the decode phase.
 - **Continuous Batching (Iteration-level Scheduling)**: Serving paradigm where requests enter and exit the batch on each token generation iteration rather than waiting for an entire batch to finish.
