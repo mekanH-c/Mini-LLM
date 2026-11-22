@@ -71,7 +71,8 @@ In SmolLM-135M:
 * PyTorch broadcasts this single position-$t$ angle across all 9 query heads:
   $$q_{\text{embed}} = (q \odot \cos) + (\text{rotate\_half}(q) \odot \sin)$$
 * Because Key $k_s$ was rotated at position $s$ when it entered the cache, the attention score recovers the relative distance:
-  $$\langle R_t q, R_s k \rangle = q^T R_{t-s} k$$
+  $$\langle R_t q, R_s k \rangle = (R_t q)^T (R_s k) = q^T R_t^T R_s k = q^T R_{s - t} k$$
+  Because rotations compose and the transpose of a rotation is its inverse ($R_t^T = R_{-t}$), only the position difference $(s - t)$ matters.
 
 ---
 
@@ -118,9 +119,9 @@ $$\text{Total Bytes} = 2 \times 30 \times 1 \times 3 \times 2048 \times 64 \time
 ## 5. Pre-Allocation vs Dynamic `torch.cat`
 
 In [`src/mini_infer/cache.py`](file:///c:/Users/HP/Downloads/mini/src/mini_infer/cache.py), we pre-allocate contiguous tensors `(batch_size, num_kv_heads, max_seq_len, head_dim)`:
-1. **Zero-Copy In-Place Assignment**:
+1. **In-place write into a preallocated buffer, no reallocation**:
    `self.k_cache[layer_idx][:B, :, start_pos:end_pos, :] = k_val`
-   This executes as a simple strided memory write.
+   This executes as an in-place write into a preallocated buffer with no reallocation.
 2. **Avoiding Heap Fragmentation**:
    Using `torch.cat([cached_k, new_k], dim=2)` at every step would re-allocate a brand new tensor $2048$ times, copying all previous tokens each time. On GPUs, this triggers CUDA malloc overhead and severely fragments device memory.
 
@@ -150,7 +151,7 @@ The Phase 2 benchmark was profiled on an NVIDIA Tesla T4 GPU (PyTorch 2.11.0+cu1
    * 2048 tokens: **30.55 ms/tok**
    Because the KV cache prevents re-computing prior representations, each decode step does constant $O(1)$ projection work. The attention dot-product against cached keys is so fast on GPU that latency is flat across the entire context window!
 2. **GPU Kernel Launch Overhead-Bound at Short Lengths**:
-   At 128 tokens, the speedup is only **1.11x** (32.89 vs 29.68 tok/s). On GPU, running SmolLM-135M incurs ~300 kernel launches per step (30 layers $\times$ projections, norms, residual additions, activations). At short lengths, the CPU-to-GPU launch latency dominates total execution time, masking the $O(N^2)$ algorithmic penalty.
+   At 128 tokens, the speedup is only **1.11x** (32.89 vs 29.68 tok/s). On GPU, kernel launch latency and framework dispatch overhead across 30 layers dominate total execution time, masking the $O(N^2)$ algorithmic penalty at short lengths.
 3. **Quadratic Scaling Dominates at Long Lengths**:
    At 2048 tokens, naive generation collapses to **5.43 tok/s** (taking over **6.25 minutes** for a single request, with each token taking **184.07 ms**). Custom Cached finishes in **62 seconds** (**6.03x faster**).
 
@@ -196,14 +197,18 @@ The trade-off: KV cache storage and memory bus loading are reduced by $3\times$,
 **Answer**:
 RoPE embeds absolute positions by rotating 2D coordinate pairs by angle $t \theta$.
 In decode, the input tensor has length 1. If we used naive sequence length slicing, it would get rotation angle $0 \times \theta$. Passing `start_pos = t` ensures the single query token across all 9 heads is rotated by $t \theta$.
-Because rotation matrices are orthogonal and commute under dot products:
-$$\langle R_t q, R_s k \rangle = (R_t q)^T (R_s k) = q^T R_t^T R_s k = q^T R_{s - t} k = q^T R_{-(t - s)} k$$
-The attention score between query $t$ and key $s$ depends strictly on their relative distance $t - s$, even though key $s$ was computed and cached dozens of steps earlier.
+Because rotations compose and the transpose of a rotation is its inverse ($R_t^T = R_{-t}$):
+$$\langle R_t q, R_s k \rangle = (R_t q)^T (R_s k) = q^T R_t^T R_s k = q^T R_{s - t} k$$
+Only the relative position difference $(s - t)$ matters, ensuring relative distance is preserved even though key $s$ was computed and cached dozens of steps earlier.
 
-### Q3: Why is inference during decode memory-bandwidth-bound rather than compute-bound?
+### Q3: Is autoregressive decode memory-bandwidth-bound or compute-bound?
 **Answer**:
-During decode, we feed a single token ($S=1$).
-For each token, we must load every parameter of the model from VRAM/RAM into the compute cores (for SmolLM-135M, ~540 MB in float32 or ~270 MB in bfloat16) plus all historical KV cache entries.
-The arithmetic intensity (FLOPs per byte loaded) is tiny: roughly $2 \times \text{Params} \times 1 \text{ token} \approx 270\text{ MFLOPs}$.
-Dividing $270\text{ MFLOPs}$ by $270\text{ MB}$ yields an arithmetic intensity of $\approx 1\text{ FLOP/byte}$.
-Since modern GPUs and CPUs can perform hundreds of FLOPs per byte of memory bandwidth, the compute cores spend most of their time idle waiting for weights and KV cache tensors to arrive from memory.
+In standard large LLMs (e.g., 7B–70B parameters), decode is classic **memory-bandwidth-bound**. Each decode step feeds a single token ($S=1$), so every model weight must be read from VRAM once per token while performing only $\approx 2 \times \text{Params}$ FLOPs of arithmetic (arithmetic intensity $\approx 1 \text{ FLOP/byte}$). High-end GPUs have arithmetic throughput exceeding memory bandwidth by hundreds of times, meaning memory bandwidth dictates throughput.
+
+**However, for this small model on this GPU, our measurements revealed that it is overhead-bound, not memory-bound**:
+* SmolLM-135M FP32 weights are about **540 MB**.
+* An NVIDIA Tesla T4 has a theoretical peak memory bandwidth of about **320 GB/s**.
+* Streaming 540 MB of weights at 320 GB/s should theoretically take only:
+  $$\frac{540 \text{ MB}}{320 \text{ GB/s}} \approx \mathbf{1.7 \text{ ms}}$$
+* Yet our measured decode latency was **~30 ms/token**!
+* Because this model is tiny (135M parameters) and runs on a discrete GPU, kernel launch latency, framework overhead, and sequential dispatch across 30 layers completely dominate execution time. The GPU is not starved for memory bandwidth here; it is waiting on launch overhead.
