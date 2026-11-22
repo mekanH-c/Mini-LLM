@@ -2,7 +2,7 @@
 
 Welcome to Phase 2 of the Mini-LLM Inference Engine. In this phase, we transitioned our inference engine from a **naive full-sequence recomputation** baseline ($O(N^2)$ time complexity) into an **optimized Key-Value Cached** engine ($O(N)$ time complexity).
 
-This document breaks down the core concepts, tensor mechanics, memory formulas, and interview preparation questions.
+This document breaks down the core concepts, tensor mechanics, memory formulas, GPU profiling observations, and interview preparation questions.
 
 ---
 
@@ -122,11 +122,68 @@ In [`src/mini_infer/cache.py`](file:///c:/Users/HP/Downloads/mini/src/mini_infer
    `self.k_cache[layer_idx][:B, :, start_pos:end_pos, :] = k_val`
    This executes as a simple strided memory write.
 2. **Avoiding Heap Fragmentation**:
-   Using `torch.cat([cached_k, new_k], dim=2)` at every step would re-allocate a brand new tensor $512$ times, copying all previous tokens each time. On GPUs, this triggers CUDA malloc overhead and severely fragments device memory.
+   Using `torch.cat([cached_k, new_k], dim=2)` at every step would re-allocate a brand new tensor $2048$ times, copying all previous tokens each time. On GPUs, this triggers CUDA malloc overhead and severely fragments device memory.
 
 ---
 
-## 6. Interview Preparation Questions & Answers
+## 6. GPU Benchmark Findings & Hardware Dynamics (NVIDIA Tesla T4)
+
+The Phase 2 benchmark was profiled on an NVIDIA Tesla T4 GPU (PyTorch 2.11.0+cu130, Transformers 5.20.2, Safetensors 0.8.0, float32) across total sequence lengths of 128, 512, and 2048:
+
+| Total Sequence Length | Generated Tokens | Engine | Throughput | Decode Time / Token | Total Time | Speedup |
+| :--- | :--- | :--- | :--- | :--- | :--- | :--- |
+| **128** | 120 | **Custom Cached** | **32.89 tok/s** | **30.41 ms/tok** | **3.65 s** | **1.11x** |
+| | | Hugging Face Reference | 30.16 tok/s | 33.16 ms/tok | 3.99 s | — |
+| | | Custom Naive | 29.68 tok/s | 33.70 ms/tok | 4.04 s | 1.0x |
+| **512** | 504 | **Custom Cached** | **33.15 tok/s** | **30.17 ms/tok** | **15.21 s** | **1.45x** |
+| | | Hugging Face Reference | 30.05 tok/s | 33.28 ms/tok | 16.78 s | — |
+| | | Custom Naive | 22.79 tok/s | 43.88 ms/tok | 22.11 s | 1.0x |
+| **2048** | 2040 | **Custom Cached** | **32.73 tok/s** | **30.55 ms/tok** | **62.33 s** | **6.03x** |
+| | | Hugging Face Reference | 30.45 tok/s | 32.84 ms/tok | 67.00 s | — |
+| | | Custom Naive | 5.43 tok/s | 184.07 ms/tok | 375.35 s (~6.25 min) | 1.0x |
+
+### Key Hardware Insights:
+1. **Cached Decode Latency is Completely Flat**:
+   Notice that for Custom Cached, per-token decode latency is:
+   * 128 tokens: **30.41 ms/tok**
+   * 512 tokens: **30.17 ms/tok**
+   * 2048 tokens: **30.55 ms/tok**
+   Because the KV cache prevents re-computing prior representations, each decode step does constant $O(1)$ projection work. The attention dot-product against cached keys is so fast on GPU that latency is flat across the entire context window!
+2. **GPU Kernel Launch Overhead-Bound at Short Lengths**:
+   At 128 tokens, the speedup is only **1.11x** (32.89 vs 29.68 tok/s). On GPU, running SmolLM-135M incurs ~300 kernel launches per step (30 layers $\times$ projections, norms, residual additions, activations). At short lengths, the CPU-to-GPU launch latency dominates total execution time, masking the $O(N^2)$ algorithmic penalty.
+3. **Quadratic Scaling Dominates at Long Lengths**:
+   At 2048 tokens, naive generation collapses to **5.43 tok/s** (taking over **6.25 minutes** for a single request, with each token taking **184.07 ms**). Custom Cached finishes in **62 seconds** (**6.03x faster**).
+
+---
+
+## 7. The RoPE Device Mismatch Post-Mortem
+
+During the initial 2048-token GPU run on Kaggle T4, execution crashed with:
+```text
+RuntimeError: Expected all tensors to be on the same device, cuda:0 and cpu, in rope.py line 83 (_set_cos_sin_cache: torch.outer(t, self.inv_freq))
+```
+
+### Why It Happened
+1. When moving the model to GPU (`model.to("cuda")`), registered buffers like `inv_freq` were moved to `cuda:0`.
+2. When total sequence length reached $2056$ (prompt 8 tokens + 2048 gen tokens), it exceeded the initial 2048 table capacity, triggering `_set_cos_sin_cache(2056)`.
+3. In `_set_cos_sin_cache`, the position index vector `t = torch.arange(seq_len, dtype=torch.float32)` was instantiated on the default device (**CPU**).
+4. Calling `torch.outer(t, self.inv_freq)` attempted an operation between a CPU tensor and a CUDA tensor.
+
+### Why CPU Tests Missed It
+* On CPU, all tensors default to `cpu`, so `torch.outer` had no device mismatch.
+* Standard unit tests generated 25 tokens, never exceeding 2048 to trigger dynamic table expansion.
+
+### The Fix & Architectural Hardening
+* Explicitly passed `device=self.inv_freq.device`:
+  ```python
+  t = torch.arange(seq_len, device=self.inv_freq.device, dtype=torch.float32)
+  ```
+* Hardened [`KVCache._grow_cache`](file:///c:/Users/HP/Downloads/mini/src/mini_infer/cache.py#L93) to explicitly allocate buffers on `self.k_cache[0].device`.
+* Added unit tests asserting buffer device consistency under dynamic table expansion.
+
+---
+
+## 8. Interview Preparation Questions & Answers
 
 ### Q1: In Grouped-Query Attention (GQA), how does repeating the KV heads work during decode, and what are the memory vs compute trade-offs?
 **Answer**:
